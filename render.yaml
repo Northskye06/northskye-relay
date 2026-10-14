@@ -1,0 +1,9 @@
+# Déploiement « Blueprint » Render : un seul clic une fois ce dossier poussé sur GitHub.
+services:
+  - type: web
+    name: northskye-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
