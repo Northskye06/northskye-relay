@@ -5,6 +5,8 @@
 const fs = require("fs");
 const path = require("path");
 
+// Changer cette valeur remet le classement en ligne à zéro au prochain démarrage du serveur (tous les joueurs repartent de la cote de départ).
+const LADDER_SEASON = "2026-10-17-reset";
 const START_ELO = 1000;
 const MIN_ELO = 100;
 const K = 32;
@@ -43,7 +45,12 @@ class FileStore {
     this.db.players = this.db.players || {}; this.db.games = this.db.games || {};
     this._t = null;
   }
-  async init() {}
+  async init() {
+    if (this.db.season !== LADDER_SEASON) {      // remise à zéro complète du classement
+      this.db = { players: {}, games: {}, season: LADDER_SEASON };
+      this._save();
+    }
+  }
   _save() {
     if (this._t) return;
     this._t = setTimeout(() => {
@@ -107,6 +114,12 @@ class PgStore {
       gid TEXT PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL, w TEXT NOT NULL,
       da INTEGER NOT NULL, db INTEGER NOT NULL, t BIGINT NOT NULL)`);
     await this.pool.query("CREATE INDEX IF NOT EXISTS players_elo ON players (elo DESC)");
+    await this.pool.query("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    const cur = await this.pool.query("SELECT v FROM meta WHERE k='season'");
+    if (!cur.rows[0] || cur.rows[0].v !== LADDER_SEASON) {      // remise à zéro complète du classement
+      await this.pool.query("TRUNCATE players, games");
+      await this.pool.query("INSERT INTO meta (k, v) VALUES ('season', $1) ON CONFLICT (k) DO UPDATE SET v = $1", [LADDER_SEASON]);
+    }
   }
   _pub(r) { return r && { pid: r.pid, name: r.name, elo: Number(r.elo), wins: Number(r.wins), losses: Number(r.losses), draws: Number(r.draws) }; }
   async register(pid, secretHash, name) {
