@@ -18,7 +18,7 @@ const LONE_REPORT_MS = 60 * 1000;       // une défaite déclarée seule est val
 /** Classement en ligne (null = désactivé si le stockage ne démarre pas). */
 let store = null;
 
-/** code -> { host:{ws,token}, guest:{ws,token}|null, lastActive } */
+/** code -> { host:{ws,token}, guest|guest2|guest3:{ws,token}|null, started, lastActive } — jusqu'à 4 joueurs (places 0 à 3). */
 const rooms = new Map();
 
 const server = http.createServer(async (req, res) => {
@@ -59,8 +59,26 @@ function send(ws, obj) {
 function newToken() {
   return crypto.randomBytes(16).toString("hex");
 }
-function other(role) {
+const ROLES = ["host", "guest", "guest2", "guest3"];
+function seatOf(role) {
+  return ROLES.indexOf(role);
+}
+function other(role) { // duel : l'autre joueur (classement)
   return role === "host" ? "guest" : "host";
+}
+function anyConnected(room) {
+  return ROLES.some((r) => connected(room, r));
+}
+function peersOf(room, role) { // places occupées (connectées) autres que `role`
+  return ROLES.filter((r) => r !== role && connected(room, r)).map(seatOf);
+}
+/** Envoie `obj` à tous les joueurs de la salle sauf `exceptRole` (ou seulement à la place `only`). */
+function broadcast(room, exceptRole, obj, only) {
+  for (const r of ROLES) {
+    if (r === exceptRole || !connected(room, r)) continue;
+    if (Number.isInteger(only) && only >= 0 && seatOf(r) !== only) continue;
+    send(room[r].ws, obj);
+  }
 }
 function connected(room, role) {
   const p = room[role];
@@ -86,6 +104,55 @@ async function settleGame(room, winner, why) {
       send(room[role] && room[role].ws, { t: "rated", gid: g.gid, delta: o.delta, elo: o.elo, rank: await store.rankOf(pid), why });
     }
   } catch (e) { console.error("settle:", e.message); }
+}
+
+const MAX_SPECTATORS = 20;
+const MAX_CMDS = 20000;
+
+function endSpectators(room, why) {
+  for (const w of room.specs) send(w, { t: "spec_end", why });
+  room.specs.clear();
+}
+
+// Mémorise le fil de la partie (départ, commandes, noms) pour les spectateurs qui arrivent en cours de route,
+// et le transmet en direct à ceux déjà présents.
+function feedSpectators(room, role, d) {
+  if (!d || typeof d.k !== "string" || !room.spec) return;
+  const sp = room.spec;
+  let fwd = false;
+  switch (d.k) {
+    case "start":
+      if (Number.isInteger(d.np) && d.np > 2) { room.nospec = true; endSpectators(room, "closed"); return; } // parties à 3-4 : pas de spectateurs
+      sp.start = { seed: d.seed, jarls: d.jarls, islands: d.islands, sig: d.sig };
+      sp.cmds = [];
+      sp.vsai = d.vsai === true;
+      if (typeof d.n0 === "string") sp.names.host = d.n0.slice(0, 20);
+      if (typeof d.n1 === "string") sp.names.guest = d.n1.slice(0, 20);
+      fwd = true;
+      break;
+    case "cmd":
+      if (Number.isInteger(d.n) && d.n >= 0 && d.n < MAX_CMDS && typeof d.c === "string") { sp.cmds[d.n] = d.c; fwd = true; }
+      break;
+    case "catchup":
+      if (Number.isInteger(d.from) && Array.isArray(d.cmds)) {
+        d.cmds.forEach((c, i) => { if (typeof c === "string" && d.from + i < MAX_CMDS) sp.cmds[d.from + i] = c; });
+        fwd = true;
+      }
+      break;
+    case "state":
+      if (Array.isArray(d.log)) { sp.cmds = d.log.filter((c) => typeof c === "string"); fwd = true; }
+      break;
+    case "name":
+      if (typeof d.n === "string") { sp.names[role] = d.n.slice(0, 20); fwd = true; }
+      break;
+    case "concede":
+      fwd = true;
+      break;
+  }
+  if (!fwd) return;
+  // les trous (commande manquante) sont comblés par les messages suivants ; on ne transmet que ce qui est utile
+  const out = d.k === "state" ? { k: "state", log: sp.cmds } : d;
+  for (const w of room.specs) send(w, { t: "spec", role, d: out });
 }
 
 function resultToWinner(role, res) { // résultat déclaré par `role` -> gagnant
@@ -135,58 +202,90 @@ wss.on("connection", (ws) => {
       case "create": {
         if (!CODE_RE.test(code)) return send(ws, { t: "error", e: "bad_code" });
         const ex = rooms.get(code);
-        if (ex && (connected(ex, "host") || connected(ex, "guest"))) return send(ws, { t: "error", e: "code_taken" });
-        const room = { host: { ws, token: newToken() }, guest: null, lastActive: Date.now() };
+        if (ex && anyConnected(ex)) return send(ws, { t: "error", e: "code_taken" });
+        const room = { host: { ws, token: newToken() }, guest: null, guest2: null, guest3: null, started: false, lastActive: Date.now(), specs: new Set(), spec: { start: null, cmds: [], names: {}, vsai: false }, nospec: false };
         rooms.set(code, room);
         ws.room = code; ws.role = "host";
-        return send(ws, { t: "created", code, token: room.host.token });
+        return send(ws, { t: "created", code, token: room.host.token, role: "host", seat: 0 });
       }
       case "join": {
         const room = rooms.get(code);
         if (!room) return send(ws, { t: "error", e: "no_room" });
-        if (room.guest) return send(ws, { t: "error", e: "room_full" });
+        const free = ROLES.slice(1).find((r) => !room[r]);
+        if (!free || room.started) return send(ws, { t: "error", e: "room_full" });
         if (!connected(room, "host")) return send(ws, { t: "error", e: "host_away" });
-        room.guest = { ws, token: newToken() };
+        room[free] = { ws, token: newToken() };
         room.lastActive = Date.now();
-        ws.room = code; ws.role = "guest";
-        send(ws, { t: "joined", code, token: room.guest.token });
-        return send(room.host.ws, { t: "peer_joined" });
+        ws.room = code; ws.role = free;
+        send(ws, { t: "joined", code, token: room[free].token, role: free, seat: seatOf(free), peers: peersOf(room, free) });
+        return broadcast(room, free, { t: "peer_joined", seat: seatOf(free) });
       }
       case "rejoin": {
         const room = rooms.get(code);
         if (!room) return send(ws, { t: "error", e: "no_room" });
         let role = null;
-        if (room.host && room.host.token === m.token) role = "host";
-        else if (room.guest && room.guest.token === m.token) role = "guest";
+        for (const r of ROLES) if (room[r] && room[r].token === m.token) role = r;
         if (!role) return send(ws, { t: "error", e: "bad_token" });
         const old = room[role].ws;
         room[role].ws = ws;
         if (old && old !== ws && old.readyState === 1) { old.room = null; old.close(); }
         ws.room = code; ws.role = role;
         room.lastActive = Date.now();
-        send(ws, { t: "rejoined", code, role, peer: connected(room, other(role)) });
-        const o = room[other(role)];
-        if (o && connected(room, other(role))) send(o.ws, { t: "peer_joined" });
+        const pe = peersOf(room, role);
+        send(ws, { t: "rejoined", code, role, seat: seatOf(role), peer: pe.length > 0, peers: pe });
+        broadcast(room, role, { t: "peer_joined", seat: seatOf(role) });
         return;
       }
       case "relay": {
         const room = ws.room && rooms.get(ws.room);
         if (!room || !ws.role) return;
         room.lastActive = Date.now();
-        const o = room[other(ws.role)];
-        if (o && o.ws && o.ws.readyState === 1) send(o.ws, { t: "relay", d: m.d });
+        if (m.d && m.d.k === "start" && ws.role === "host") room.started = true;
+        broadcast(room, ws.role, { t: "relay", d: m.d, from: seatOf(ws.role) }, m.d && Number.isInteger(m.d.to) ? m.d.to : undefined);
+        feedSpectators(room, ws.role, m.d);
         return;
+      }
+      case "spec_opt": { // l'hôte autorise (ou non) les spectateurs
+        const room = ws.room && rooms.get(ws.room);
+        if (room && ws.role === "host") room.nospec = m.on === false;
+        if (room && room.nospec) endSpectators(room, "closed");
+        return;
+      }
+      case "spectate": {
+        const room = rooms.get(code);
+        if (!room || room.nospec || !room.spec || !room.spec.start) return send(ws, { t: "error", e: "no_room" });
+        if (room.specs.size >= MAX_SPECTATORS) return send(ws, { t: "error", e: "room_full" });
+        room.specs.add(ws);
+        ws.specRoom = code;
+        send(ws, { t: "spec_joined", code, start: room.spec.start, cmds: room.spec.cmds.slice(), names: room.spec.names, vsai: !!room.spec.vsai });
+        return;
+      }
+      case "list": { // parties en cours que l'on peut regarder
+        const out = [];
+        for (const [c, room] of rooms) {
+          if (room.nospec || !room.spec || !room.spec.start) continue;
+          if (!anyConnected(room)) continue;
+          out.push({ code: c, names: room.spec.names, n: room.spec.cmds.length, vsai: !!room.spec.vsai, watchers: room.specs.size });
+          if (out.length >= 30) break;
+        }
+        return send(ws, { t: "games", games: out });
       }
       case "leave": {
         const room = ws.room && rooms.get(ws.room);
         if (room && ws.role) {
           const g = room.game;
-          if (g && !g.settled && !g.reports[ws.role] && g.pids.host && g.pids.guest && Date.now() - g.startedAt > MIN_FORFEIT_MS) {
+          if (g && !g.settled && (ws.role === "host" || ws.role === "guest") && !g.reports[ws.role] && g.pids.host && g.pids.guest && Date.now() - g.startedAt > MIN_FORFEIT_MS) {
             settleGame(room, other(ws.role), "forfeit"); // abandon en cours de partie : défaite pour celui qui part
           }
-          const o = room[other(ws.role)];
-          if (o && o.ws) send(o.ws, { t: "peer_quit" });
-          rooms.delete(ws.room);
+          if (ws.role === "host") {
+            broadcast(room, "host", { t: "peer_quit", seat: 0, end: true });
+            endSpectators(room, "ended");
+            rooms.delete(ws.room);
+          } else {
+            room[ws.role] = null; // la place est libérée (sauf partie commencée : plus personne ne peut rejoindre)
+            broadcast(room, ws.role, { t: "peer_quit", seat: seatOf(ws.role) });
+            if (!anyConnected(room)) rooms.delete(ws.room);
+          }
         }
         ws.room = null; ws.role = null;
         return;
@@ -219,12 +318,15 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    if (ws.specRoom) {
+      const sr = rooms.get(ws.specRoom);
+      if (sr) sr.specs.delete(ws);
+    }
     const room = ws.room && rooms.get(ws.room);
     if (!room || !ws.role) return;
     if (room[ws.role] && room[ws.role].ws === ws) {
       room[ws.role].ws = null;
-      const o = room[other(ws.role)];
-      if (o && connected(room, other(ws.role))) send(o.ws, { t: "peer_left" });
+      broadcast(room, ws.role, { t: "peer_left", seat: seatOf(ws.role) });
     }
   });
   ws.on("error", () => {});
@@ -239,7 +341,7 @@ setInterval(() => {
   });
   const now = Date.now();
   for (const [code, room] of rooms) {
-    if (!connected(room, "host") && !connected(room, "guest") && now - room.lastActive > ROOM_TTL_MS) rooms.delete(code);
+    if (!anyConnected(room) && now - room.lastActive > ROOM_TTL_MS) rooms.delete(code);
   }
 }, 20000);
 
